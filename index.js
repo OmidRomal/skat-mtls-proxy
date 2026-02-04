@@ -5,6 +5,7 @@
 
 const https = require('https');
 const http = require('http');
+const crypto = require('crypto');
 
 const PORT = process.env.PORT || 3000;
 const SKAT_HOST = 'ei-indberetning.skat.dk';
@@ -145,7 +146,14 @@ const server = http.createServer((req, res) => {
             'SOAPAction': soapAction
           },
           rejectUnauthorized: true,
-          minVersion: 'TLSv1.2'
+          // SKAT/SFG endpoints have historically been strict/legacy TLS; we force TLS 1.2
+          // to avoid handshake issues (common symptom: ECONNRESET / "socket hang up").
+          minVersion: 'TLSv1.2',
+          maxVersion: 'TLSv1.2',
+          // Ensure SNI is set explicitly
+          servername: SKAT_HOST,
+          // OpenSSL 3 compatibility for some legacy servers
+          secureOptions: crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT || 0,
         };
 
         const proxyReq = https.request(options, proxyRes => {
@@ -164,6 +172,23 @@ const server = http.createServer((req, res) => {
             });
             res.end(responseBody);
           });
+        });
+
+        // Extra TLS/socket diagnostics
+        proxyReq.on('socket', (socket) => {
+          try {
+            socket.on('secureConnect', () => {
+              const proto = typeof socket.getProtocol === 'function' ? socket.getProtocol() : '(unknown)';
+              const cipher = typeof socket.getCipher === 'function' ? socket.getCipher() : undefined;
+              console.log(`[PROXY] TLS secureConnect. Protocol=${proto}`);
+              if (cipher) console.log(`[PROXY] TLS cipher: ${cipher.name} ${cipher.version}`);
+            });
+            socket.on('close', (hadError) => {
+              console.log(`[PROXY] Socket closed (hadError=${hadError})`);
+            });
+          } catch {
+            // ignore
+          }
         });
 
         proxyReq.on('error', (e) => {
