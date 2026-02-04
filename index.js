@@ -11,6 +11,15 @@ const PORT = process.env.PORT || 3000;
 const SKAT_HOST = 'ei-indberetning.skat.dk';
 const SKAT_PORT = 444;
 
+// Upstream request timeout (ms)
+const SKAT_REQUEST_TIMEOUT_MS = parseInt(process.env.SKAT_REQUEST_TIMEOUT_MS || '120000', 10);
+
+// Use a dedicated agent to avoid any unexpected socket reuse issues
+const httpsAgent = new https.Agent({
+  keepAlive: false,
+  maxSockets: 25,
+});
+
 // Load certificate from environment (base64 encoded PFX)
 const CERT_BASE64 = process.env.OCES3_CERTIFICATE_BASE64;
 const CERT_PASSWORD = process.env.OCES3_CERTIFICATE_PASSWORD;
@@ -125,7 +134,12 @@ const server = http.createServer((req, res) => {
         // Parse URL and get SKAT path
         const urlParams = new URL(req.url, `http://${req.headers.host}`);
         const skatPath = urlParams.searchParams.get('path') || '/B2B/EIndkomst/EIndkomstServiceFunctionBinding';
-        const soapAction = req.headers['soapaction'] || '';
+        const rawSoapAction = req.headers['soapaction'] || '';
+        const soapAction = typeof rawSoapAction === 'string' ? rawSoapAction : String(rawSoapAction);
+        // SOAP 1.1 stacks sometimes require SOAPAction to be quoted
+        const normalizedSoapAction = soapAction
+          ? (soapAction.trim().startsWith('"') ? soapAction.trim() : `"${soapAction.replace(/"/g, '').trim()}"`)
+          : '';
 
         console.log(`[PROXY] === New Request ===`);
         console.log(`[PROXY] Target: ${SKAT_HOST}:${SKAT_PORT}${skatPath}`);
@@ -138,12 +152,15 @@ const server = http.createServer((req, res) => {
           port: SKAT_PORT,
           path: skatPath,
           method: 'POST',
+          agent: httpsAgent,
           pfx: pfxBuffer,
           passphrase: CERT_PASSWORD,
           headers: {
             'Content-Type': req.headers['content-type'] || 'text/xml; charset=utf-8',
             'Content-Length': Buffer.byteLength(body, 'utf8'),
-            'SOAPAction': soapAction
+            // Force close to keep the connection simple for legacy endpoints
+            'Connection': 'close',
+            'SOAPAction': normalizedSoapAction,
           },
           rejectUnauthorized: true,
           // SKAT/SFG endpoints have historically been strict/legacy TLS; we force TLS 1.2
@@ -152,8 +169,11 @@ const server = http.createServer((req, res) => {
           maxVersion: 'TLSv1.2',
           // Ensure SNI is set explicitly
           servername: SKAT_HOST,
-          // OpenSSL 3 compatibility for some legacy servers
-          secureOptions: crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT || 0,
+          // OpenSSL 3 compatibility for some legacy servers (secure renegotiation quirks)
+          secureOptions:
+            ((crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT || 0) |
+              (crypto.constants.SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION || 0)) ||
+            0,
         };
 
         const proxyReq = https.request(options, proxyRes => {
@@ -172,6 +192,24 @@ const server = http.createServer((req, res) => {
             });
             res.end(responseBody);
           });
+        });
+
+        // Make sure we don't hang forever if SKAT never responds
+        proxyReq.setTimeout(SKAT_REQUEST_TIMEOUT_MS, () => {
+          console.error(`[PROXY] Upstream timeout after ${SKAT_REQUEST_TIMEOUT_MS}ms`);
+          try {
+            proxyReq.destroy(new Error('Upstream timeout'));
+          } catch {
+            // ignore
+          }
+
+          if (!res.writableEnded) {
+            sendJson(504, {
+              error: 'SKAT request timed out',
+              details: `No response within ${SKAT_REQUEST_TIMEOUT_MS}ms`,
+              code: 'ETIMEDOUT',
+            });
+          }
         });
 
         // Extra TLS/socket diagnostics
@@ -206,6 +244,8 @@ const server = http.createServer((req, res) => {
           } else if (e.code === 'ETIMEDOUT') {
             errorMessage = 'Connection to SKAT timed out';
           }
+
+          if (res.writableEnded) return;
 
           sendJson(502, {
             error: 'Failed to connect to SKAT',
